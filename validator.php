@@ -12,12 +12,15 @@ use Composer\Config;
 use Composer\IO\NullIO;
 use Composer\Repository\ComposerRepository;
 use Composer\Repository\RepositoryInterface;
+use Composer\Util\HttpDownloader;
 use Symfony\Component\Console\Application;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Helper\ProgressBar;
 use Symfony\Component\Console\Helper\Table;
 use Symfony\Component\Console\Helper\TableCell;
 use Symfony\Component\Console\Helper\TableSeparator;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputDefinition;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
@@ -26,9 +29,11 @@ use Symfony\Component\Yaml\Parser;
 
 final class Validate extends Command
 {
-    private $parser;
-    private $composerRepositories = array();
-    private $composerConfig;
+    private Parser $parser;
+    private array $composerRepositories = array();
+    private array $composerPackageExists = array();
+    private Config $composerConfig;
+    private HttpDownloader $httpDownloader;
 
     public function __construct()
     {
@@ -37,9 +42,15 @@ final class Validate extends Command
         $this->parser = new Parser();
         $this->composerConfig = new Config(false);
         $this->composerConfig->merge(array('config' => array('cache-dir' => sys_get_temp_dir().'/php-security-advisories')));
+        $this->httpDownloader = new HttpDownloader(new NullIO(), $this->composerConfig);
     }
 
-    protected function execute(InputInterface $input, OutputInterface $output)
+    protected function configure(): void
+    {
+        $this->addArgument('file', InputArgument::OPTIONAL, 'Path to a single YAML file to validate.');
+    }
+
+    protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $io = new SymfonyStyle($input, $output);
 
@@ -73,13 +84,25 @@ final class Validate extends Command
 
         $messages = array();
 
-        /* @var $dir \SplFileInfo[] */
-        $dir = new \RecursiveIteratorIterator(new RecursiveCallbackFilterIterator(new \RecursiveDirectoryIterator(__DIR__), $advisoryFilter));
+        $singleFile = $input->getArgument('file');
+        if (null !== $singleFile) {
+            if (!is_file($singleFile)) {
+                $io->error(sprintf('File "%s" does not exist.', $singleFile));
 
-        $progress = new ProgressBar($io, count(iterator_to_array($dir)));
+                return 1;
+            }
+
+            $files = array(new \SplFileInfo(realpath($singleFile)));
+        } else {
+            /* @var $dir \Traversable<\SplFileInfo> */
+            $dir = new \RecursiveIteratorIterator(new RecursiveCallbackFilterIterator(new \RecursiveDirectoryIterator(__DIR__), $advisoryFilter));
+            $files = iterator_to_array($dir);
+        }
+
+        $progress = new ProgressBar($io, count($files));
         $progress->start();
 
-        foreach ($dir as $file) {
+        foreach ($files as $file) {
             if (!$file->isFile()) {
                 $progress->advance();
 
@@ -121,24 +144,19 @@ final class Validate extends Command
                         }
 
                         if (!isset($data['composer-repository'])) {
-                            $data['composer-repository'] = 'https://packagist.org';
+                            $data['composer-repository'] = 'https://repo.packagist.org';
                         }
 
                         if (!empty($data['composer-repository'])) {
-                            $composerRepository = $this->getComposerRepository($data['composer-repository']);
-
-                            $found = false;
-                            foreach ($composerRepository->search($composerPackage, RepositoryInterface::SEARCH_NAME) as $package) {
-                                if ($package['name'] === $composerPackage) {
-                                    $found = true;
-                                    break;
-                                }
-                            }
-                            if (!$found) {
+                            if (!$this->composerPackageExists($data['composer-repository'], $composerPackage)) {
                                 $messages[$path][] = sprintf('Invalid composer package (not found in repository %s)', $data['composer-repository']);
                             }
                         }
                     }
+                }
+
+                if (isset($data['cve']) && !str_starts_with($data['cve'], 'CVE-')) {
+                    $messages[$path][] = '"cve" must be a valid CVE number when provided.';
                 }
 
                 if (!isset($data['branches'])) {
@@ -157,10 +175,6 @@ final class Validate extends Command
                 $upperBoundWithoutLowerBound = null;
 
                 foreach ($data['branches'] as $name => $branch) {
-                    if (!preg_match('/^([\d.\-]+(\.x)?(-dev)?|master)$/', $name)) {
-                        $messages[$path][] = sprintf('Invalid branch name "%s".', $name);
-                    }
-
                     if ($keys = array_diff(array_keys($branch), array('time', 'versions'))) {
                         foreach ($keys as $key) {
                             $messages[$path][] = sprintf('Key "%s" is not supported for branch "%s".', $key, $name);
@@ -169,6 +183,14 @@ final class Validate extends Command
 
                     if (!array_key_exists('time', $branch)) {
                         $messages[$path][] = sprintf('Key "time" is required for branch "%s".', $name);
+                    } elseif (isset($branch['time'])) {
+                        $timestamp = is_int($branch['time']) ? $branch['time'] : strtotime($branch['time']);
+
+                        if ($timestamp === false) {
+                            $messages[$path][] = sprintf('"time" is invalid for branch "%s", given "%s".', $name, $branch['time']);
+                        } elseif ($timestamp > time()) {
+                            $messages[$path][] = sprintf('"time" cannot be in the future for branch "%s", given "%s".', $name, $branch['time']);
+                        }
                     }
 
                     if (!isset($branch['versions'])) {
@@ -187,6 +209,12 @@ final class Validate extends Command
                                 if (null !== $upperBound) {
                                     $messages[$path][] = sprintf('"versions" cannot have multiple upper bounds for branch "%s".', $name);
                                     continue;
+                                }
+
+                                // Enforce using an exclusive upper bound referencing the patched version when it exists.
+                                // Unpatched vulnerabilities (that have no time defined) are excluded from this check.
+                                if (str_starts_with($version, '<=') && isset($branch['time'])) {
+                                    $messages[$path][] = sprintf('"versions" must use an exclusive upper bound for branch "%s", referencing the release shipping the patch.', $name);
                                 }
 
                                 $upperBound = $version;
@@ -268,7 +296,28 @@ final class Validate extends Command
         return count($messages);
     }
 
-    private function getComposerRepository($uri)
+    private function composerPackageExists(string $repositoryUri, string $package): bool
+    {
+        $key = $repositoryUri."\0".$package;
+
+        if (!isset($this->composerPackageExists[$key])) {
+            $repository = $this->getComposerRepository($repositoryUri);
+
+            $found = false;
+            foreach ($repository->search($package, RepositoryInterface::SEARCH_NAME) as $result) {
+                if ($result['name'] === $package) {
+                    $found = true;
+                    break;
+                }
+            }
+
+            $this->composerPackageExists[$key] = $found;
+        }
+
+        return $this->composerPackageExists[$key];
+    }
+
+    private function getComposerRepository($uri): ComposerRepository
     {
         if (!isset($this->composerRepositories[$uri])) {
             $repository = new ComposerRepository(
@@ -276,7 +325,8 @@ final class Validate extends Command
                     'url' => $uri,
                 ),
                 new NullIO(),
-                $this->composerConfig
+                $this->composerConfig,
+                $this->httpDownloader
             );
 
             $this->composerRepositories[$uri] = $repository;
@@ -288,12 +338,12 @@ final class Validate extends Command
 
 final class Validator extends Application
 {
-    protected function getCommandName(InputInterface $input)
+    protected function getCommandName(InputInterface $input): ?string
     {
         return 'validate';
     }
 
-    protected function getDefaultCommands()
+    protected function getDefaultCommands(): array
     {
         $defaultCommands = parent::getDefaultCommands();
 
@@ -302,7 +352,7 @@ final class Validator extends Application
         return $defaultCommands;
     }
 
-    public function getDefinition()
+    public function getDefinition(): InputDefinition
     {
         $inputDefinition = parent::getDefinition();
 

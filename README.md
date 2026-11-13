@@ -16,20 +16,13 @@ into the public domain.
 Checking for Vulnerabilities
 ----------------------------
 
-There are several possibilities to check for vulnerabilities in your
-applications beside manual checks:
+To check your application's dependencies for known vulnerabilities, run
+[`composer audit`][1] from your project's root directory (the directory containing
+`composer.json` and `composer.lock`):
 
- * Use the [Local CLI tool][1]:
-
-        local-php-security-checker --path=/path/to/composer.lock
-
- * Use the [Symfony CLI][2] (no PHP dependency, no third-party API calls,
-   checks are done locally on a clone of this repository):
-
-        symfony security:check --dir /path/to/composer.lock
-
-**TIP**: If you are using Github, you can use the PHP Security Checker [Github
-Action][3] to automatically check for vulnerabilities when pushing code.
+```sh
+composer audit
+```
 
 Contributing
 ------------
@@ -82,6 +75,4 @@ If some affected code is available through different Composer entries (like
 when you have read-only subtree splits of a main repository), duplicate the
 information in several files.
 
-[1]: https://github.com/fabpot/local-php-security-checker
-[2]: https://symfony.com/download
-[3]: https://github.com/marketplace/actions/the-php-security-checker
+[1]: https://getcomposer.org/doc/03-cli.md#audit

@@ -1,0 +1,11 @@
+title:     Missing check that a point is on the prime subgroup for Edwards25519
+link:      https://00f.net/2025/12/30/libsodium-vulnerability
+cve:       ~
+branches:
+    master:
+        time:     2025-12-30 00:00:00
+        versions: ['>=2', '<2.5.0']
+    1.x:
+        time:     2025-12-30 00:00:00
+        versions: ['<1.24.0']
+reference: composer://paragonie/sodium_compat
